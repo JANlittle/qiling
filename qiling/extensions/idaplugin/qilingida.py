@@ -1572,6 +1572,7 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
         func = self.hook_data['func']
         # if current address is in other segment or function, do nothing
         ida_logger.debug(f"Current address: {hex(ida_addr)}")
+        # In other segment or function
         code_segm = [".text", "code", "CODE", ]
         if get_segm_name(ida_addr) not in code_segm or IDA.get_function(ida_addr).start_ea != func.start_ea:
             return
@@ -1774,7 +1775,7 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
                 "see_other_block": False,
             }
         ql.run(begin=self.deflatqlemu.ql_addr_from_ida(first_block.start_ea) + self.append, end=0, count=0xFFF)
-        # if last block is real block, we should continue search path
+        # if last block is real block rather than retn block, we should continue search path
         if self.paths[self.first_block][0] in self.real_blocks:
             ctx_queue.put(ql.save())
             bbid_queue.put(self.paths[self.first_block][0])
@@ -2068,6 +2069,25 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
             bb = self.bb_mapping[bb]
         return f"Block id: {bb.id}, start_address: {bb.start_ea:x}, end_address: {bb.end_ea:x}, type: {bb.type}"
 
+    def _ret_real_block_piece(self, bbid):
+        for piece in self.real_block_pieces:
+            if bbid in piece:
+                return piece
+        return None
+    
+    def _search_real_block_piece(self, bbid):
+        piece = [bbid]
+        temp_stack = [bbid]
+        while len(temp_stack) != 0:
+            cur = temp_stack.pop()
+            for s in self.bb_mapping[cur].succs():
+                if s.id in self.retn_blocks:
+                    piece.append(s.id)
+                elif s.id in self.real_blocks:
+                    piece.append(s.id)
+                    temp_stack.append(s.id)
+        self.real_block_pieces.append(piece)
+
     def ql_parse_blocks_for_deobf(self):
         cur_addr = IDA.get_current_address()
         flowchart = IDA.get_flowchart(cur_addr)
@@ -2075,35 +2095,48 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
         self.bb_mapping = {bb.id:bb for bb in flowchart}
         if flowchart is None:
             return
-        bb_count = {}       # count the reference of each basic block
-        for bb in flowchart:
-            for succ in bb.succs():
-                if succ.id not in bb_count:
-                    bb_count[succ.id] = 0
-                bb_count[succ.id] += 1
-        max_ref_bb_id = None
-        max_ref = 0
-        for bb_id, ref in bb_count.items():
-            if ref > max_ref:
-                max_ref = ref
-                max_ref_bb_id = bb_id
+        # count the reference of each basic block
+        bb_count = [len([bbb for bbb in bb.preds()]) for bb in flowchart]
+        max_ref_bb_id = bb_count.index(max(bb_count))
+        # pre_dispatcher is the block which has the most references.
         self.pre_dispatcher = max_ref_bb_id
         try:
-            self.dispatcher = list(self.bb_mapping[self.pre_dispatcher].succs())[0].id
-            self.first_block = flowchart[0].id
+            self.first_block:int = flowchart[0].id
+            # dispatcher is the block which the only successor of first_block.
+            self.dispatcher = list(self.bb_mapping[self.first_block].succs())[0].id
         except IndexError:
             ida_logger.error("Fail to get dispatcher and first_block.")
             return
         self.real_blocks = []
         self.fake_blocks = []
         self.retn_blocks = []
+        # Due to the fact that compilation optimization may divide real blocks into multiple sub real blocks, 
+        # making it difficult to distinguish them through connection relationships, 
+        # and the pattern of fake blocks is relatively fixed, 
+        # the identification of fake blocks is left to the user-defined custom_is_fake_block to determine.
         for bb in flowchart:
-            if self.pre_dispatcher in [b.id for b in bb.succs()] and IDA.get_instructions_count(bb.start_ea, bb.end_ea) > 1:
-                self.real_blocks.append(bb.id)
-            elif IDA.block_is_terminating(bb):
+            if IDA.block_is_terminating(bb):
                 self.retn_blocks.append(bb.id)
-            elif bb.id != self.first_block and bb.id != self.pre_dispatcher and bb.id != self.dispatcher:
+            elif self.userobj.custom_is_fake_block(self.qlemu.ql, bb):
                 self.fake_blocks.append(bb.id)
+            elif bb.id != self.pre_dispatcher and bb.id != self.dispatcher:
+                self.real_blocks.append(bb.id)
+        # Now we need to determine which sub real blocks belong to the same real block.
+        # We will start with the real block connected to the fake block 
+        # and use BFS to obtain the subsequent real blocks, until the pre_dispatcher or retnblock is reached.
+        self.real_block_pieces = [[self.first_block]]
+        for fake in self.fake_blocks:
+            fake_block = self.bb_mapping[fake]
+            for succ in fake_block.succs():
+                if succ.id in self.retn_blocks:
+                    self.real_block_pieces.append([succ.id])
+                elif succ.id in self.real_blocks:
+                    self._search_real_block_piece(succ.id)
+
+        for real in self.real_blocks:
+            if self._ret_real_block_piece(real) is None:
+                self._search_real_block_piece(real)
+
         for bbid in self.real_blocks:
             IDA.color_block(self.bb_mapping[bbid], Colors.Green.value)
         for bbid in self.fake_blocks:
@@ -2122,6 +2155,9 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
         for s in map(self._block_str, self.fake_blocks): ida_logger.info(s)
         ida_logger.info(f"Return blocks:")
         for s in map(self._block_str, self.retn_blocks): ida_logger.info(s)
+        ida_logger.info(f"Real block pieces:")
+        for piece in self.real_block_pieces:
+            ida_logger.info("\n".join(map(self._block_str, piece)))
         ida_logger.info(f"Auto analysis finished, please check whether the result is correct.")
         ida_logger.info(f"You may change the property of each block manually if necessary.")
 
