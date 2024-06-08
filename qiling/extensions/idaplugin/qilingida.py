@@ -14,6 +14,7 @@ from enum import Enum
 from elftools.elf.elffile import ELFFile
 from json import load
 import queue
+from typing import List, Dict
 
 # IDA Python SDK
 from idaapi import *
@@ -1351,6 +1352,18 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
             warning("ERROR: Failed to connect to Github. Try again later.")
             ida_logger.warning("Failed to connect to Github when checking for the latest update. Try again later.")
 
+    class BlocksPiece:
+        def __init__(self, bb_mapping: Dict, piece: List[int]):
+            self.piece = piece
+            self.start_ea = bb_mapping[piece[0]].start_ea
+            self.braddrs: Dict[int, int] = {}
+
+        def add_braddr(self, braddr, addr):
+            self.braddrs[braddr] = addr
+
+        def is_bb_in_piece(self, bbid):
+            return bbid in self.piece
+
     def _remove_from_bb_lists(self, bbid):
         if bbid in self.real_blocks:
             self.real_blocks.remove(bbid)
@@ -1717,6 +1730,7 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
     #    analysis is always possible since the brain of a reverse engineer is the best decompiler
     #    and emulator, isn't it? :D
     def _search_path(self):
+        # TODO: Change to use real_block_piece as the unit of measurement
         self.paths = {bbid: [] for bbid in self.bb_mapping.keys()}
         reals = [self.first_block, *self.real_blocks]
         self.is_visited = {bb: False for bb in reals}
@@ -2068,12 +2082,15 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
         if type(bb) is int:
             bb = self.bb_mapping[bb]
         return f"Block id: {bb.id}, start_address: {bb.start_ea:x}, end_address: {bb.end_ea:x}, type: {bb.type}"
+    
+    def _block_piece_str(self, piece):
+        return "\n".join(map(self._block_str, piece))
 
-    def _ret_real_block_piece(self, bbid):
+    def _is_in_block_piece(self, bbid):
         for piece in self.real_block_pieces:
-            if bbid in piece:
-                return piece
-        return None
+            if piece.is_bb_in_piece(bbid):
+                return True
+        return False
     
     def _search_real_block_piece(self, bbid):
         piece = [bbid]
@@ -2086,7 +2103,7 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
                 elif s.id in self.real_blocks:
                     piece.append(s.id)
                     temp_stack.append(s.id)
-        self.real_block_pieces.append(piece)
+        self.real_block_pieces.append(QlEmuPlugin.BlocksPiece(self.bb_mapping, piece))
 
     def ql_parse_blocks_for_deobf(self):
         cur_addr = IDA.get_current_address()
@@ -2124,17 +2141,17 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
         # Now we need to determine which sub real blocks belong to the same real block.
         # We will start with the real block connected to the fake block 
         # and use BFS to obtain the subsequent real blocks, until the pre_dispatcher or retnblock is reached.
-        self.real_block_pieces = [[self.first_block]]
+        self.real_block_pieces = [QlEmuPlugin.BlocksPiece(self.bb_mapping, [self.first_block])]
         for fake in self.fake_blocks:
             fake_block = self.bb_mapping[fake]
             for succ in fake_block.succs():
                 if succ.id in self.retn_blocks:
-                    self.real_block_pieces.append([succ.id])
+                    self.real_block_pieces.append(QlEmuPlugin.BlocksPiece(self.bb_mapping, [succ.id]))
                 elif succ.id in self.real_blocks:
                     self._search_real_block_piece(succ.id)
 
         for real in self.real_blocks:
-            if self._ret_real_block_piece(real) is None:
+            if not self._is_in_block_piece(real):
                 self._search_real_block_piece(real)
 
         for bbid in self.real_blocks:
@@ -2149,15 +2166,15 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
         ida_logger.info(f"First block: {self._block_str(self.first_block)}")
         ida_logger.info(f"Dispatcher: {self._block_str(self.dispatcher)}")
         ida_logger.info(f"Pre dispatcher: {self._block_str(self.pre_dispatcher)}")
-        ida_logger.info(f"Real blocks:")
+        ida_logger.info(f"Real blocks(count: {len(self.real_blocks)}):")
         for s in map(self._block_str, self.real_blocks): ida_logger.info(s)
-        ida_logger.info(f"Fake blocks:")
+        ida_logger.info(f"Fake blocks(count: {len(self.fake_blocks)}):")
         for s in map(self._block_str, self.fake_blocks): ida_logger.info(s)
-        ida_logger.info(f"Return blocks:")
+        ida_logger.info(f"Return blocks(count: {len(self.retn_blocks)}):")
         for s in map(self._block_str, self.retn_blocks): ida_logger.info(s)
-        ida_logger.info(f"Real block pieces:")
+        ida_logger.info(f"Real block pieces(count: {len(self.real_block_pieces)}):")
         for piece in self.real_block_pieces:
-            ida_logger.info("\n".join(map(self._block_str, piece)))
+            ida_logger.info(self._block_piece_str(piece.piece))
         ida_logger.info(f"Auto analysis finished, please check whether the result is correct.")
         ida_logger.info(f"You may change the property of each block manually if necessary.")
 
