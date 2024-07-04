@@ -1738,6 +1738,14 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
         self.deflatqlemu.path = self.qlemu.path
         self.deflatqlemu.rootfs = self.qlemu.rootfs
         first_block = self.bb_mapping[self.first_block]
+        
+        for bbid in reals:
+            braddr = self._find_branch_in_real_block(self.bb_mapping[bbid])
+            if braddr is not None:
+                ida_logger.debug(f"Find branch at {hex(braddr)}")
+            else:
+                ida_logger.debug(f"Branch not found in {self._block_str(bbid)}")
+
         if IDA.get_ql_arch_string() == "arm32":
             if self._thumb_detect(first_block.start_ea):
                 ida_logger.info(f"Thumb detected, enable it.")
@@ -2003,6 +2011,11 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
             braddr = self._find_branch_in_real_block(bb)
             if braddr is None:
                 last_instr_address = IDA.get_prev_head(bb.end_ea)
+                ida_logger.debug(f"Last instruction address: {hex(last_instr_address)}")
+                if not IDA.get_instruction(last_instr_address).lower().startswith("j"):
+                    continue
+                if IDA.get_instruction_size(last_instr_address) < 5:
+                    last_instr_address = IDA.get_prev_head(last_instr_address)
                 buffer = [0x90] * (bb.end_ea - last_instr_address)
                 if len(self.paths[bbid]) != 1:
                     ida_logger.warning(f"Found wrong ways in block: {self._block_str(bb)}, should be 1 path but get {len(self.paths[bbid])}")
@@ -2136,7 +2149,7 @@ class QlEmuPlugin(plugin_t, UI_Hooks):
                 self.retn_blocks.append(bb.id)
             elif self.userobj.custom_is_fake_block(self.qlemu.ql, bb):
                 self.fake_blocks.append(bb.id)
-            elif bb.id != self.pre_dispatcher and bb.id != self.dispatcher:
+            elif bb.id != self.pre_dispatcher and bb.id != self.dispatcher and bb.id != self.first_block:
                 self.real_blocks.append(bb.id)
         # Now we need to determine which sub real blocks belong to the same real block.
         # We will start with the real block connected to the fake block 
